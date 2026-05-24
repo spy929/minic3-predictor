@@ -11,7 +11,8 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.metrics import (accuracy_score, roc_auc_score, roc_curve, confusion_matrix,
-                             precision_score, recall_score, f1_score, calibration_curve)
+                             precision_score, recall_score, f1_score)
+from sklearn.calibration import calibration_curve
 from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
 import plotly.express as px
@@ -245,7 +246,7 @@ class ClinicalPredictor:
 
             plt.tight_layout()
             plt.savefig('calibration_plot.png', dpi=300, bbox_inches='tight')
-            plt.show()
+            plt.close()
 
             return self.metrics
 
