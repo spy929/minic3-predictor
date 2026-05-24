@@ -8,9 +8,10 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.metrics import (accuracy_score, roc_auc_score, roc_curve, confusion_matrix,
-                             precision_score, recall_score, f1_score)
+                             precision_score, recall_score, f1_score, calibration_curve)
 from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
 import plotly.express as px
@@ -28,7 +29,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ==================== Custom CSS (Fixed) ====================
+# ==================== Custom CSS ====================
 st.markdown("""
 <style>
     .main-header {
@@ -73,7 +74,7 @@ def generate_clinical_data():
     """Generate high-quality synthetic clinical data"""
     np.random.seed(42)
     n = 2000
-    
+
     data = {
         'Patient_ID': [f'MC3-{str(i).zfill(5)}' for i in range(1, n+1)],
         'Age': np.random.normal(62, 12, n).astype(int).clip(25, 90),
@@ -92,26 +93,26 @@ def generate_clinical_data():
         'Albumin': np.random.normal(38, 5, n).round(1).clip(25, 50),
         'Tumor_Type': np.random.choice(['NSCLC', 'Melanoma', 'RCC', 'Urothelial', 'HNSCC'], n),
     }
-    
+
     df = pd.DataFrame(data)
-    
+
     # Generate outcomes
     response_prob = 0.2 + 0.05*(df['Dose']>1) + 0.1*(df['PDL1']=='High') - 0.05*df['ECOG']
     response_prob = response_prob.clip(0.1, 0.85)
     df['Response'] = np.random.binomial(1, response_prob)
-    
+
     ae_prob = 0.3 + 0.05*(df['Dose']>3) + 0.008*(df['Age']-60).clip(0,30) + 0.002*df['CRP']
     ae_prob = ae_prob.clip(0.15, 0.9)
     df['AE'] = np.random.binomial(1, ae_prob)
-    
-    df['PFS'] = np.where(df['Response']==1, 
-                         np.random.normal(18,6,n), 
+
+    df['PFS'] = np.where(df['Response']==1,
+                         np.random.normal(18,6,n),
                          np.random.normal(5,2,n)).clip(1,48).round(1)
-    
+
     # Risk stratification
     risk_score = df['ECOG']*2 + (df['LDH']>250).astype(int)*3 + (df['NLR']>5).astype(int)*2
     df['Risk_Group'] = pd.cut(risk_score, bins=[0,3,6,10], labels=['Low', 'Medium', 'High'])
-    
+
     return df
 
 # ==================== Machine Learning Model ====================
@@ -120,68 +121,75 @@ class ClinicalPredictor:
         self.model_response = None
         self.model_ae = None
         self.scaler = StandardScaler()
-        self.feature_cols = ['Age', 'ECOG', 'Dose', 'Prior_Therapies', 'Metastasis_Sites', 
+        self.feature_cols = ['Age', 'ECOG', 'Dose', 'Prior_Therapies', 'Metastasis_Sites',
                              'Liver_Mets', 'Brain_Mets', 'TMB', 'NLR', 'LDH', 'CRP', 'Albumin']
         self.metrics = {}
         self.roc_data = {}
         self.importance_df = None
         self.cm_data = {}
-        
+        self.lr_auc = None
+
     def prepare_features(self, df, fit=False):
         df_encoded = df.copy()
         df_encoded['PDL1_encoded'] = df['PDL1'].map({'Negative':0, 'Low':1, 'High':2})
         features = self.feature_cols + ['PDL1_encoded']
         X = df_encoded[[f for f in features if f in df_encoded.columns]].fillna(0)
-        
+
         if fit:
             X_scaled = self.scaler.fit_transform(X)
         else:
             X_scaled = self.scaler.transform(X)
         return X_scaled
-    
+
     def train(self, df):
         with st.spinner('Training machine learning models...'):
             X = self.prepare_features(df, fit=True)
             y_res = df['Response']
             y_ae = df['AE']
-            
+
             X_train, X_test, y_res_train, y_res_test = train_test_split(
                 X, y_res, test_size=0.2, random_state=42, stratify=y_res
             )
             _, _, y_ae_train, y_ae_test = train_test_split(
                 X, y_ae, test_size=0.2, random_state=42, stratify=y_ae
             )
-            
+
+            # Random Forest
             self.model_response = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42)
             self.model_response.fit(X_train, y_res_train)
-            
+
             self.model_ae = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42)
             self.model_ae.fit(X_train, y_ae_train)
-            
+
+            # Predictions
             y_res_prob = self.model_response.predict_proba(X_test)[:,1]
             y_ae_prob = self.model_ae.predict_proba(X_test)[:,1]
             y_res_pred = self.model_response.predict(X_test)
             y_ae_pred = self.model_ae.predict(X_test)
-            
+
+            # ROC
             fpr_res, tpr_res, _ = roc_curve(y_res_test, y_res_prob)
             fpr_ae, tpr_ae, _ = roc_curve(y_ae_test, y_ae_prob)
-            
+
             self.roc_data = {
                 'response': {'fpr': fpr_res, 'tpr': tpr_res, 'auc': roc_auc_score(y_res_test, y_res_prob)},
                 'ae': {'fpr': fpr_ae, 'tpr': tpr_ae, 'auc': roc_auc_score(y_ae_test, y_ae_prob)}
             }
-            
+
+            # Confusion matrices
             self.cm_data = {
                 'response': confusion_matrix(y_res_test, y_res_pred),
                 'ae': confusion_matrix(y_ae_test, y_ae_pred)
             }
-            
+
+            # Feature importance
             feature_names = self.feature_cols + ['PDL1']
             self.importance_df = pd.DataFrame({
                 'Feature': feature_names,
                 'Importance': self.model_response.feature_importances_
             }).sort_values('Importance', ascending=False)
-            
+
+            # Metrics
             self.metrics = {
                 'response': {
                     'accuracy': accuracy_score(y_res_test, y_res_pred),
@@ -198,18 +206,49 @@ class ClinicalPredictor:
                     'auc': self.roc_data['ae']['auc']
                 }
             }
-            
+
+            # Cross-validation
             cv = StratifiedKFold(5, shuffle=True, random_state=42)
             cv_res = cross_val_score(self.model_response, X, y_res, cv=cv, scoring='roc_auc')
             cv_ae = cross_val_score(self.model_ae, X, y_ae, cv=cv, scoring='roc_auc')
-            
+
             self.metrics['response']['cv_mean'] = cv_res.mean()
             self.metrics['response']['cv_std'] = cv_res.std()
             self.metrics['ae']['cv_mean'] = cv_ae.mean()
             self.metrics['ae']['cv_std'] = cv_ae.std()
-            
+
+            # ========== Logistic Regression Baseline ==========
+            lr = LogisticRegression(max_iter=1000)
+            lr.fit(X_train, y_res_train)
+            y_res_prob_lr = lr.predict_proba(X_test)[:,1]
+            self.lr_auc = roc_auc_score(y_res_test, y_res_prob_lr)
+            print(f"Logistic Regression AUC (response): {self.lr_auc:.3f}")
+
+            # ========== Calibration Curves ==========
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+            prob_true_res, prob_pred_res = calibration_curve(y_res_test, y_res_prob, n_bins=10)
+            ax1.plot(prob_pred_res, prob_true_res, marker='o', label='Random Forest')
+            ax1.plot([0, 1], [0, 1], linestyle='--', label='Perfect calibration')
+            ax1.set_xlabel('Mean predicted probability')
+            ax1.set_ylabel('Fraction of positives')
+            ax1.set_title('Calibration plot (Response)')
+            ax1.legend()
+
+            prob_true_ae, prob_pred_ae = calibration_curve(y_ae_test, y_ae_prob, n_bins=10)
+            ax2.plot(prob_pred_ae, prob_true_ae, marker='o', label='Random Forest')
+            ax2.plot([0, 1], [0, 1], linestyle='--', label='Perfect calibration')
+            ax2.set_xlabel('Mean predicted probability')
+            ax2.set_ylabel('Fraction of positives')
+            ax2.set_title('Calibration plot (AE)')
+            ax2.legend()
+
+            plt.tight_layout()
+            plt.savefig('calibration_plot.png', dpi=300, bbox_inches='tight')
+            plt.show()
+
             return self.metrics
-    
+
     def predict(self, features_df):
         X = self.prepare_features(features_df)
         resp_prob = self.model_response.predict_proba(X)[0][1]
@@ -229,7 +268,7 @@ df = st.session_state.df
 # ==================== Sidebar Navigation ====================
 with st.sidebar:
     st.markdown("## 🧬 Navigation")
-    
+
     page = st.radio(
         "Select Module",
         [
@@ -240,14 +279,14 @@ with st.sidebar:
             "🔬 Biomarker Analysis"
         ]
     )
-    
+
     st.markdown("---")
     st.markdown("### 📊 Data Summary")
     st.metric("Total Patients", f"{len(df):,}")
     st.markdown("### 🎯 Model Performance")
     st.metric("Response AUC", f"{st.session_state.metrics['response']['auc']:.3f}")
     st.metric("AE AUC", f"{st.session_state.metrics['ae']['auc']:.3f}")
-    
+
     st.markdown("---")
     st.caption(f"© 2024 MINIC3 System")
     st.caption(f"Updated: {datetime.now().strftime('%Y-%m-%d')}")
@@ -255,7 +294,7 @@ with st.sidebar:
 # ==================== Page 1: Data Overview ====================
 if page == "📊 Data Overview":
     st.markdown('<div class="sub-header">📊 Clinical Data Overview</div>', unsafe_allow_html=True)
-    
+
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Response Rate", f"{df['Response'].mean()*100:.1f}%")
@@ -265,9 +304,9 @@ if page == "📊 Data Overview":
         st.metric("Median PFS", f"{df['PFS'].median():.1f} months")
     with col4:
         st.metric("High Risk", f"{(df['Risk_Group']=='High').mean()*100:.1f}%")
-    
+
     tab1, tab2 = st.tabs(["Data Preview", "Distributions"])
-    
+
     with tab1:
         st.dataframe(df.head(50), use_container_width=True)
     with tab2:
@@ -282,10 +321,10 @@ if page == "📊 Data Overview":
 # ==================== Page 2: Patient Prediction ====================
 elif page == "🎯 Patient Prediction":
     st.markdown('<div class="sub-header">🎯 Individual Patient Prediction</div>', unsafe_allow_html=True)
-    
+
     with st.form("prediction_form"):
         col1, col2 = st.columns(2)
-        
+
         with col1:
             age = st.slider("Age", 18, 90, 60)
             gender = st.selectbox("Gender", ["Male", "Female"])
@@ -293,7 +332,7 @@ elif page == "🎯 Patient Prediction":
             dose = st.selectbox("Dose (mg/kg)", [0.3, 1.0, 3.0, 10.0])
             prior = st.number_input("Prior Therapies", 0, 5, 1)
             mets = st.number_input("Metastasis Sites", 0, 6, 1)
-            
+
         with col2:
             pdl1 = st.selectbox("PD-L1", ["Negative", "Low", "High"])
             tmb = st.number_input("TMB (mut/Mb)", 0, 50, 8)
@@ -301,9 +340,9 @@ elif page == "🎯 Patient Prediction":
             ldh = st.number_input("LDH (U/L)", 100, 600, 200)
             crp = st.number_input("CRP (mg/L)", 1, 150, 10)
             alb = st.number_input("Albumin (g/L)", 25, 50, 38)
-        
+
         submitted = st.form_submit_button("🔮 Predict", use_container_width=True)
-        
+
         if submitted:
             input_df = pd.DataFrame([{
                 'Age': age, 'Gender': gender, 'ECOG': ecog, 'Dose': dose,
@@ -311,12 +350,12 @@ elif page == "🎯 Patient Prediction":
                 'Liver_Mets': 0, 'Brain_Mets': 0,
                 'PDL1': pdl1, 'TMB': tmb, 'NLR': nlr, 'LDH': ldh, 'CRP': crp, 'Albumin': alb
             }])
-            
+
             resp_prob, ae_prob = st.session_state.model.predict(input_df)
-            
+
             st.markdown("---")
             col1, col2 = st.columns(2)
-            
+
             with col1:
                 st.metric("Response Probability", f"{resp_prob*100:.1f}%")
                 if resp_prob > 0.5:
@@ -325,7 +364,7 @@ elif page == "🎯 Patient Prediction":
                     st.warning("⚠️ Medium probability")
                 else:
                     st.error("❌ Low probability")
-                    
+
             with col2:
                 st.metric("AE Risk", f"{ae_prob*100:.1f}%")
                 if ae_prob < 0.3:
@@ -338,12 +377,12 @@ elif page == "🎯 Patient Prediction":
 # ==================== Page 3: Model Performance ====================
 elif page == "📈 Model Performance":
     st.markdown('<div class="sub-header">📈 Model Performance Analysis</div>', unsafe_allow_html=True)
-    
+
     tab1, tab2, tab3 = st.tabs(["ROC Curves", "Feature Importance", "Metrics"])
-    
+
     with tab1:
         col1, col2 = st.columns(2)
-        
+
         with col1:
             fig = go.Figure()
             fig.add_trace(go.Scatter(
@@ -355,7 +394,7 @@ elif page == "📈 Model Performance":
             fig.add_trace(go.Scatter(x=[0,1], y=[0,1], mode='lines', line=dict(dash='dash', color='gray')))
             fig.update_layout(title='Response Prediction ROC')
             st.plotly_chart(fig, use_container_width=True)
-            
+
         with col2:
             fig = go.Figure()
             fig.add_trace(go.Scatter(
@@ -367,7 +406,7 @@ elif page == "📈 Model Performance":
             fig.add_trace(go.Scatter(x=[0,1], y=[0,1], mode='lines', line=dict(dash='dash', color='gray')))
             fig.update_layout(title='AE Prediction ROC')
             st.plotly_chart(fig, use_container_width=True)
-    
+
     with tab2:
         fig = px.bar(st.session_state.model.importance_df.head(10),
                     x='Importance', y='Feature', orientation='h',
@@ -375,10 +414,10 @@ elif page == "📈 Model Performance":
                     color='Importance', color_continuous_scale='Viridis')
         fig.update_layout(yaxis={'categoryorder':'total ascending'})
         st.plotly_chart(fig, use_container_width=True)
-    
+
     with tab3:
         col1, col2 = st.columns(2)
-        
+
         with col1:
             st.markdown("**Response Model**")
             st.json({
@@ -389,7 +428,9 @@ elif page == "📈 Model Performance":
                 "AUC": f"{st.session_state.metrics['response']['auc']:.3f}",
                 "5-fold CV": f"{st.session_state.metrics['response']['cv_mean']:.3f} (±{st.session_state.metrics['response']['cv_std']:.3f})"
             })
-            
+            if st.session_state.model.lr_auc is not None:
+                st.info(f"Logistic Regression AUC (baseline): {st.session_state.model.lr_auc:.3f}")
+
         with col2:
             st.markdown("**AE Model**")
             st.json({
@@ -404,31 +445,31 @@ elif page == "📈 Model Performance":
 # ==================== Page 4: Survival Analysis ====================
 elif page == "📉 Survival Analysis":
     st.markdown('<div class="sub-header">📉 Survival Analysis</div>', unsafe_allow_html=True)
-    
+
     group = st.selectbox("Group by", ['Dose', 'PDL1', 'ECOG', 'Risk_Group'])
-    
+
     fig, ax = plt.subplots(figsize=(10,6))
-    
+
     for val in df[group].unique():
         data = df[df[group]==val]['PFS']
         times = np.sort(data.unique())
         survival = [(data >= t).mean() for t in times]
         ax.step(times, survival, where='post', label=str(val), linewidth=2)
-    
+
     ax.set_xlabel('Time (months)')
     ax.set_ylabel('Survival Probability')
     ax.set_title(f'Kaplan-Meier Curves by {group}')
     ax.legend()
     ax.grid(True, alpha=0.3)
-    
+
     st.pyplot(fig)
 
 # ==================== Page 5: Biomarker Analysis ====================
 elif page == "🔬 Biomarker Analysis":
     st.markdown('<div class="sub-header">🔬 Biomarker Analysis</div>', unsafe_allow_html=True)
-    
+
     tab1, tab2 = st.tabs(["PD-L1 Analysis", "TMB Analysis"])
-    
+
     with tab1:
         col1, col2 = st.columns(2)
         with col1:
@@ -437,7 +478,7 @@ elif page == "🔬 Biomarker Analysis":
         with col2:
             response_by_pdl1 = df.groupby('PDL1')['Response'].mean() * 100
             st.bar_chart(response_by_pdl1)
-    
+
     with tab2:
         col1, col2 = st.columns(2)
         with col1:
